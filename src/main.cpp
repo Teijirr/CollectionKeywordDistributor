@@ -3,6 +3,11 @@
 
 namespace
 {
+	// ------------------------------------------------------------------
+	// INI loading
+	// ------------------------------------------------------------------
+
+	// key/value pair from one INI file
 	struct IniEntry
 	{
 		std::string file;
@@ -11,16 +16,7 @@ namespace
 		std::string value;
 	};
 
-	struct DistributionRule
-	{
-		std::string file;
-		std::string section;
-		std::vector<std::string> plugins;
-		std::vector<std::string> keywords;
-	};
-
 	std::vector<IniEntry> g_entries;
-	std::vector<DistributionRule> g_rules;
 
 	std::string Trim(std::string_view a_str)
 	{
@@ -49,6 +45,12 @@ namespace
 			start = end + 1;
 		}
 		return result;
+	}
+
+	std::string ToLower(std::string a_str)
+	{
+		std::ranges::transform(a_str, a_str.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+		return a_str;
 	}
 
 	void ReadIniFile(const std::filesystem::path& a_path)
@@ -99,9 +101,7 @@ namespace
 			if (!entry.is_regular_file()) {
 				continue;
 			}
-			auto ext = entry.path().extension().string();
-			std::ranges::transform(ext, ext.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-			if (ext == ".ini") {
+			if (ToLower(entry.path().extension().string()) == ".ini") {
 				files.push_back(entry.path());
 			}
 		}
@@ -115,13 +115,11 @@ namespace
 		SKSE::log::info("Loaded {} INI file(s), {} entries", files.size(), g_entries.size());
 	}
 
-	std::string ToLower(std::string a_str)
-	{
-		std::ranges::transform(a_str, a_str.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-		return a_str;
-	}
+	// ------------------------------------------------------------------
+	// Rules
+	// ------------------------------------------------------------------
 
-	// True if the record exists in a file
+	// True if the record exists in a_file
 	bool IsRecordInFile(const RE::TESForm* a_form, const RE::TESFile* a_file)
 	{
 		const auto* files = a_form->sourceFiles.array;
@@ -135,6 +133,16 @@ namespace
 		}
 		return false;
 	}
+
+	struct DistributionRule
+	{
+		std::string file;
+		std::string section;
+		std::vector<std::string> plugins;
+		std::vector<std::string> keywords;
+	};
+
+	std::vector<DistributionRule> g_rules;
 
 	void BuildRules()
 	{
@@ -170,6 +178,7 @@ namespace
 	{
 		auto& keywordArray = a_dataHandler->GetFormArray<RE::BGSKeyword>();
 
+		// Reuse an existing keyword
 		for (auto* keyword : keywordArray) {
 			if (!keyword) {
 				continue;
@@ -180,6 +189,7 @@ namespace
 			}
 		}
 
+		// Create a keyword
 		auto* factory = RE::IFormFactory::GetConcreteFormFactoryByType<RE::BGSKeyword>();
 		auto* keyword = factory ? factory->Create() : nullptr;
 		if (!keyword) {
@@ -207,6 +217,115 @@ namespace
 		return result;
 	}
 
+	// ------------------------------------------------------------------
+	// Collections: every form that can hold a keyword
+	// ------------------------------------------------------------------
+
+	struct KeywordTarget
+	{
+		RE::TESForm* form;
+		RE::BGSKeywordForm* keywordForm;
+	};
+
+	// Walks collections recursively and gathers every reachable form that can hold keywords
+	// (armor, weapon, ammo, misc, potion, book, scroll, ingredient, soul gem, key, spell, NPC, ...).
+	class KeywordTargetCollector
+	{
+	public:
+		void CollectRoot(RE::TESForm* a_form)
+		{
+			if (auto* npc = a_form->As<RE::TESNPC>()) {
+				CollectContainer(npc);
+			}
+			else {
+				Collect(a_form);
+			}
+		}
+
+		[[nodiscard]] const std::vector<KeywordTarget>& Targets() const { return _targets; }
+
+	private:
+		void Collect(RE::TESForm* a_form)
+		{
+			if (!a_form || !_visited.insert(a_form).second) {
+				return;
+			}
+
+			if (auto* outfit = a_form->As<RE::BGSOutfit>()) {
+				for (auto* item : outfit->outfitItems) {
+					Collect(item);
+				}
+				return;
+			}
+			if (auto* levItem = a_form->As<RE::TESLevItem>()) {
+				CollectLeveled(levItem);
+				return;
+			}
+			if (auto* levChar = a_form->As<RE::TESLevCharacter>()) {
+				CollectLeveled(levChar);
+				return;
+			}
+			if (auto* levSpell = a_form->As<RE::TESLevSpell>()) {
+				CollectLeveled(levSpell);
+				return;
+			}
+			if (auto* formList = a_form->As<RE::BGSListForm>()) {
+				for (auto* item : formList->forms) {
+					Collect(item);
+				}
+				return;
+			}
+			if (auto* container = a_form->As<RE::TESObjectCONT>()) {
+				CollectContainer(container);
+				return;
+			}
+
+			// Target if it can hold keywords
+			if (auto* keywordForm = skyrim_cast<RE::BGSKeywordForm*>(a_form)) {
+				_targets.push_back({ a_form, keywordForm });
+			}
+		}
+
+		void CollectLeveled(const RE::TESLeveledList* a_list)
+		{
+			if (!a_list) {
+				return;
+			}
+			for (const auto& entry : a_list->entries) {
+				Collect(entry.form);
+			}
+		}
+
+		void CollectContainer(const RE::TESContainer* a_container)
+		{
+			if (!a_container || !a_container->containerObjects) {
+				return;
+			}
+			for (std::uint32_t i = 0; i < a_container->numContainerObjects; ++i) {
+				if (const auto* entry = a_container->containerObjects[i]) {
+					Collect(entry->obj);
+				}
+			}
+		}
+
+		std::vector<KeywordTarget> _targets;
+		std::unordered_set<const RE::TESForm*> _visited;
+	};
+
+	template <class T>
+	std::size_t CollectRoots(RE::TESDataHandler* a_dataHandler, const RE::TESFile* a_file, KeywordTargetCollector& a_collector)
+	{
+		std::size_t count = 0;
+		for (auto* form : a_dataHandler->GetFormArray<T>()) {
+			if (!form || !IsRecordInFile(form, a_file)) {
+				continue;
+			}
+			++count;
+			a_collector.CollectRoot(form);
+		}
+		return count;
+	}
+
 	void ApplyRule(RE::TESDataHandler* a_dataHandler, const DistributionRule& a_rule)
 	{
 		SKSE::log::info("=== {} [{}] ===", a_rule.file, a_rule.section);
@@ -222,9 +341,8 @@ namespace
 			return;
 		}
 
-		std::size_t armorsTouched = 0;
-		std::size_t keywordsAdded = 0;
-		std::size_t skippedLeveled = 0;
+		KeywordTargetCollector collector;
+		std::size_t outfits = 0, levItems = 0, levChars = 0, levSpells = 0, formLists = 0, containers = 0, actors = 0;
 
 		for (const auto& pluginName : a_rule.plugins) {
 			const auto* file = a_dataHandler->LookupModByName(pluginName);
@@ -233,47 +351,55 @@ namespace
 				continue;
 			}
 
-			for (const auto* outfit : a_dataHandler->GetFormArray<RE::BGSOutfit>()) {
-				if (!outfit || !IsRecordInFile(outfit, file)) {
+			outfits += CollectRoots<RE::BGSOutfit>(a_dataHandler, file, collector);
+			levItems += CollectRoots<RE::TESLevItem>(a_dataHandler, file, collector);
+			levChars += CollectRoots<RE::TESLevCharacter>(a_dataHandler, file, collector);
+			levSpells += CollectRoots<RE::TESLevSpell>(a_dataHandler, file, collector);
+			formLists += CollectRoots<RE::BGSListForm>(a_dataHandler, file, collector);
+			containers += CollectRoots<RE::TESObjectCONT>(a_dataHandler, file, collector);
+			actors += CollectRoots<RE::TESNPC>(a_dataHandler, file, collector);
+		}
+
+		SKSE::log::info("  collections: {} outfit(s), {} leveled item list(s), {} leveled actor list(s), {} leveled spell list(s), {} form list(s), {} container(s), {} actor base(s)",
+			outfits, levItems, levChars, levSpells, formLists, containers, actors);
+
+		std::size_t formsTouched = 0;
+		std::size_t keywordsAdded = 0;
+		std::map<RE::FormType, std::size_t> touchedByType;
+
+		for (const auto& target : collector.Targets()) {
+			bool touched = false;
+			for (auto* keyword : keywords) {
+				if (target.keywordForm->HasKeyword(keyword)) {
 					continue;
 				}
-
-				for (auto* item : outfit->outfitItems) {
-					if (!item) {
-						continue;
-					}
-
-					auto* armor = item->As<RE::TESObjectARMO>();
-					if (!armor) {
-						if (item->GetFormType() == RE::FormType::LeveledItem) {
-							++skippedLeveled;
-						}
-						continue;
-					}
-
-					bool touched = false;
-					for (auto* keyword : keywords) {
-						if (armor->HasKeyword(keyword)) {
-							continue;
-						}
-						if (armor->AddKeyword(keyword)) {
-							++keywordsAdded;
-							touched = true;
-							SKSE::log::debug("  + {} -> {:08X} '{}'", keyword->GetFormEditorID(), armor->GetFormID(), armor->GetName());
-						}
-					}
-					if (touched) {
-						++armorsTouched;
-					}
+				if (target.keywordForm->AddKeyword(keyword)) {
+					++keywordsAdded;
+					touched = true;
+					SKSE::log::debug("  + {} -> {:08X} [{}] '{}'",
+						keyword->GetFormEditorID(),
+						target.form->GetFormID(),
+						RE::FormTypeToString(target.form->GetFormType()),
+						target.form->GetName());
 				}
+			}
+			if (touched) {
+				++formsTouched;
+				++touchedByType[target.form->GetFormType()];
 			}
 		}
 
-		SKSE::log::info("  -> added {} keyword(s) to {} armor(s), {} leveled item(s) not expanded", keywordsAdded, armorsTouched, skippedLeveled);
+		SKSE::log::info("  -> {} keyword-capable form(s) reachable, added {} keyword(s) to {} form(s)", collector.Targets().size(), keywordsAdded, formsTouched);
+
+		for (const auto& [type, count] : touchedByType) {
+			SKSE::log::info("      {}: {}", RE::FormTypeToString(type), count);
+		}
 	}
 
 	void OnDataLoaded()
 	{
+		SKSE::log::info("Data loaded");
+
 		auto* dataHandler = RE::TESDataHandler::GetSingleton();
 		if (!dataHandler) {
 			SKSE::log::error("TESDataHandler not available");
