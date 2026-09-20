@@ -201,7 +201,18 @@ namespace
 
 		keywordArray.push_back(keyword);
 
+		const auto& [map, lock] = RE::TESForm::GetAllFormsByEditorID();
+		if (map) {
+			RE::BSWriteLockGuard guard{ lock };
+			map->emplace(RE::BSFixedString(a_editorID.c_str()), keyword);
+		}
+		
+		if (RE::TESForm::LookupByEditorID(a_editorID) != keyword) {
+			SKSE::log::warn("  keyword '{}' is not resolvable by editor ID; other plugins' editor ID filters won't find it", a_editorID);
+		}
+
 		SKSE::log::info("  created keyword '{}' ({:08X})", a_editorID, keyword->GetFormID());
+
 		return keyword;
 	}
 
